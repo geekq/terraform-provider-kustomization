@@ -3,6 +3,7 @@ package kustomize
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -15,6 +16,8 @@ import (
 	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sunstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
+	k8s "k8s.io/client-go/kubernetes"
+	k8sclientcmd "k8s.io/client-go/tools/clientcmd"
 )
 
 // Basic test
@@ -95,6 +98,130 @@ resource "kustomization_resource" "dep2" {
 	manifest = data.kustomization_build.test.manifests["apps/Deployment/test-basic/test2"]
 }
 `
+}
+func TestRecreateManuallyModifiedResources(t *testing.T) {
+
+	resource.Test(t, resource.TestCase{
+		//PreCheck:  func() { testAccPreCheck(t) },
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{
+			//
+			//
+			// Applying initial config with a svc and deployment in a namespace
+			{
+				Config: testAccResourceKustomizationConfig_basicInitial("test_kustomizations/basic/initial"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("kustomization_resource.ns", "id"),
+					resource.TestCheckResourceAttrSet("kustomization_resource.dep1", "id"),
+					delayForManualDebugging(10),
+				),
+			},
+			//
+			//
+			// Simulate a manual change to the deployment bypassing terraform,
+			// here - change the `scale` attribute of a Deployment directly via k8s API
+			{
+				Config: testAccResourceKustomizationConfig_basicInitial("test_kustomizations/basic/initial"),
+				Check:  modifyDeploymentScale("test-basic", "test", 2),
+			},
+			//
+			//
+			// Reapply the same terraform definition again, expecting this to revert the manual change
+			{
+				Config: testAccResourceKustomizationConfig_basicInitial("test_kustomizations/basic/initial"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("kustomization_resource.ns", "id"),
+					resource.TestCheckResourceAttrSet("kustomization_resource.dep1", "id"),
+					// TODO Also check the terraform (state) changes / plan
+					delayForManualDebugging(10),
+					validateDeploymentScale("test-basic", "test", 1),
+				),
+			},
+			//
+			//
+			// Test state import
+			{
+				ResourceName:      "kustomization_resource.ns",
+				ImportStateId:     "_/Namespace/_/test-basic",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// Function to modify the scale of a Kubernetes Deployment directly via k8s API
+func modifyDeploymentScale(namespace, name string, replicas int32) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		clientset, err := initializeKubernetesClient()
+		if err != nil {
+			return err
+		}
+
+		// Check the previous state of the Deployment
+		deploymentClient := clientset.AppsV1().Deployments(namespace)
+		deployment, err := deploymentClient.Get(context.TODO(), name, k8smetav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		// Scale Deployment to desired replicas
+		deployment.Spec.Replicas = int32Ptr(replicas)
+		_, err = deploymentClient.Update(context.TODO(), deployment, k8smetav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+
+		// Add delay for changes to propagate
+		// TODO Find some more robust approach than a delay
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+}
+
+// Function to validate the scale of a Kubernetes Deployment
+func validateDeploymentScale(namespace, name string, expectedReplicas int32) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		clientset, err := initializeKubernetesClient()
+		if err != nil {
+			return err
+		}
+
+		// Get the Deployment
+		deployment, err := clientset.AppsV1().Deployments(namespace).Get(context.TODO(), name, k8smetav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		// Validate the replica count
+		if *deployment.Spec.Replicas != expectedReplicas {
+			return fmt.Errorf("expected %d replicas, found %d", expectedReplicas, *deployment.Spec.Replicas)
+		}
+		return nil
+	}
+}
+
+func initializeKubernetesClient() (*k8s.Clientset, error) {
+	kubeconfig := os.Getenv("KUBECONFIG_PATH")
+	if kubeconfig == "" {
+		// TODO Show instructions to user?
+	}
+	config, err := k8sclientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	return k8s.NewForConfig(config)
+}
+
+// Helper function to create an int32 pointer required by k8s API
+func int32Ptr(i int32) *int32 { return &i }
+
+// Function to introduce a delay, helpful for observing k8s resources slowly changing in e.g. k9s
+func delayForManualDebugging(seconds int) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		time.Sleep(time.Duration(seconds) * time.Second)
+		return nil
+	}
 }
 
 // Import test invalid id
